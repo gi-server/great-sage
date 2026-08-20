@@ -1,0 +1,20 @@
+# Great Sage — AI/Document Intelligence Service
+# Core
+fastapi>=0.115.0
+uvicorn>=0.30.0
+python-multipart>=0.0.9
+
+# OCR & Document Processing
+PyMuPDF>=1.25.0
+Pillow>=10.0.0
+pytesseract>=0.3.10
+
+# HTTP client (for Ollama + webhook)
+httpx>=0.27.0
+
+# Pydantic (pulled by FastAPI, pinned for clarity)
+pydantic>=2.9.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.24.0
