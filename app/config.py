@@ -7,6 +7,10 @@ All secrets and service URLs are configured here — nothing is hardcoded.
 import os
 from dataclasses import dataclass, field
 
+from dotenv import load_dotenv
+
+# Load environment variables from .env file (if present) before any config is read
+load_dotenv()
 
 @dataclass(frozen=True)
 class Settings:
