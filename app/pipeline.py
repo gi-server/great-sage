@@ -1,21 +1,19 @@
 """
 End-to-end document processing pipeline.
-
-Orchestrates:  file → OCR → text extraction → AI classification → webhook result
-
-Graceful degradation:
-  - If OCR fails → webhook with status=failed, empty classification.
-  - If OCR succeeds but LLM fails → webhook preserves ocr_text, empty classification, error_message set.
-  - If everything succeeds → webhook with status=success, full classification.
 """
 
 from __future__ import annotations
 
 import logging
+import uuid
+import json
 from typing import TYPE_CHECKING
+from sqlmodel import Session
 
+from app.database import engine
 from app.llm import classify_document
 from app.ocr import extract_text
+from app.models import Job, JobFile
 from app.schemas import ClassificationResult, WebhookPayload
 from app.webhook import deliver_webhook
 
@@ -32,17 +30,13 @@ async def process_document(
     settings: "Settings",
 ) -> None:
     """
-    Run the full document processing pipeline and deliver the result via webhook.
-
-    This function is designed to be called from the background worker — it
-    never raises. All outcomes are communicated through the webhook payload.
+    Direct single-document processing pipeline (backward compatibility helper).
     """
     ocr_text: str | None = None
 
-    # ── Step 1: OCR ──────────────────────────────────────────────────────
+    # Step 1: OCR
     try:
         ocr_text = extract_text(file_content, filename, settings)
-        logger.info("OCR succeeded for document %d (%d chars)", document_id, len(ocr_text))
     except Exception:
         logger.exception("OCR failed for document %d", document_id)
         payload = WebhookPayload(
@@ -55,9 +49,7 @@ async def process_document(
         await deliver_webhook(payload, settings)
         return
 
-    # ── Step 2: AI Classification ────────────────────────────────────────
     if not ocr_text:
-        # OCR succeeded but produced no text — still report cleanly
         payload = WebhookPayload(
             document_id=document_id,
             status="failed",
@@ -68,11 +60,10 @@ async def process_document(
         await deliver_webhook(payload, settings)
         return
 
+    # Step 2: AI Classification
     try:
         classification = await classify_document(ocr_text, settings)
-        logger.info("AI classification succeeded for document %d", document_id)
     except Exception as exc:
-        # ── Graceful degradation: OCR succeeded, LLM failed ──────────
         logger.exception("AI classification failed for document %d", document_id)
         payload = WebhookPayload(
             document_id=document_id,
@@ -84,7 +75,7 @@ async def process_document(
         await deliver_webhook(payload, settings)
         return
 
-    # ── Step 3: Success ──────────────────────────────────────────────────
+    # Step 3: Success
     payload = WebhookPayload(
         document_id=document_id,
         status="success",
@@ -92,3 +83,90 @@ async def process_document(
         classification=classification,
     )
     await deliver_webhook(payload, settings)
+
+
+async def process_job(
+    job_id: uuid.UUID,
+    settings: "Settings",
+) -> None:
+    """
+    Process all files within a job.
+    """
+    with Session(engine) as session:
+        job = session.get(Job, job_id)
+        if not job or job.status == "cancelled":
+            return
+        
+        job.status = "processing"
+        session.add(job)
+        session.commit()
+        
+        all_success = True
+        
+        for file in job.files:
+            session.refresh(job) # check if cancelled
+            if job.status == "cancelled":
+                return
+            
+            file.status = "processing"
+            session.add(file)
+            session.commit()
+            
+            # OCR
+            try:
+                with open(file.filepath, "rb") as f:
+                    file_content = f.read()
+                ocr_text = extract_text(file_content, file.filename, settings)
+                file.ocr_text = ocr_text
+            except Exception as e:
+                logger.exception("OCR failed")
+                file.status = "failed"
+                file.error_message = f"OCR failed: {str(e)}"
+                session.add(file)
+                session.commit()
+                all_success = False
+                continue
+                
+            if not ocr_text:
+                file.status = "failed"
+                file.error_message = "OCR produced no text"
+                session.add(file)
+                session.commit()
+                all_success = False
+                continue
+                
+            # AI Classification
+            try:
+                classification = await classify_document(ocr_text, settings, context=job.context)
+                file.ai_result = classification.model_dump_json()
+                file.status = "completed"
+            except Exception as e:
+                logger.exception("AI classification failed")
+                file.status = "failed"
+                file.error_message = f"AI classification failed: {str(e)}"
+                all_success = False
+            
+            session.add(file)
+            session.commit()
+            
+        # Finish job
+        job.status = "completed" if all_success else "failed"
+        session.add(job)
+        session.commit()
+        
+        # Fire legacy webhook if needed
+        if job.legacy_document_id:
+            file = job.files[0]
+            status_str = "success" if file.status == "completed" else "failed"
+            classification = ClassificationResult()
+            if file.ai_result:
+                classification = ClassificationResult(**json.loads(file.ai_result))
+                
+            payload = WebhookPayload(
+                document_id=job.legacy_document_id,
+                status=status_str,
+                ocr_text=file.ocr_text,
+                classification=classification,
+                error_message=file.error_message
+            )
+            await deliver_webhook(payload, settings)

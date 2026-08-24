@@ -2,7 +2,8 @@
 Great Sage — AI/Document Intelligence Service
 
 FastAPI application providing:
-  POST /api/v1/analyze  — Accept a document for async OCR + AI classification
+  POST /api/v1/analyze  — Legacy endpoint for Poneglyph
+  POST /api/v2/jobs     — Batch processing API
   GET  /health          — Health check (Tesseract + Ollama reachability)
 """
 
@@ -10,9 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status, Depends
 from fastapi.responses import JSONResponse
 
 from app.auth import verify_api_key
@@ -20,7 +23,11 @@ from app.config import Settings, load_settings
 from app.llm import check_ollama
 from app.ocr import check_tesseract, is_allowed_file
 from app.schemas import AcceptedResponse, HealthResponse
-from app.worker import Job, Worker
+from app.worker import Worker
+from app.database import init_db, get_session
+from app.routers import jobs
+from app.models import Job, JobFile
+from sqlmodel import Session
 
 logger = logging.getLogger("great_sage")
 
@@ -32,9 +39,12 @@ logger = logging.getLogger("great_sage")
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle for the worker."""
     settings: Settings = app.state.settings
+    init_db()
+    
     worker = Worker(settings)
     app.state.worker = worker
     await worker.start()
+    
     logger.info("Great Sage is ready")
     yield
     await worker.stop()
@@ -63,10 +73,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="Great Sage",
         description="AI/Document Intelligence Service",
-        version="1.0.0",
+        version="2.0.0",
         lifespan=lifespan,
     )
     app.state.settings = settings
+
+    app.include_router(jobs.router)
 
     # ── Routes ────────────────────────────────────────────────────────────
 
@@ -74,26 +86,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "/api/v1/analyze",
         response_model=AcceptedResponse,
         status_code=status.HTTP_202_ACCEPTED,
-        summary="Submit a document for analysis",
+        summary="Submit a document for analysis (Legacy)",
     )
     async def analyze(
         request: Request,
         file: UploadFile = File(...),
         document_id: int = Form(...),
+        session: Session = Depends(get_session)
     ):
         """
         Accept a document file (PDF, PNG, JPG) for asynchronous processing.
-
         Returns HTTP 202 immediately. The result is delivered via webhook.
         """
         settings: Settings = request.app.state.settings
 
         # ── Auth ──
-        verify_api_key(
-            settings,
-            x_api_key=request.headers.get("X-API-Key"),
-            authorization=request.headers.get("Authorization"),
-        )
+        if settings.great_sage_api_key:
+            verify_api_key(
+                settings,
+                x_api_key=request.headers.get("X-API-Key"),
+                authorization=request.headers.get("Authorization"),
+            )
 
         # ── Validate filename extension ──
         if not file.filename or not is_allowed_file(file.filename):
@@ -115,15 +128,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail="Uploaded file is empty",
             )
 
+        # ── Create job in DB ──
+        job = Job(legacy_document_id=document_id)
+        session.add(job)
+        session.commit()
+        session.refresh(job)
+        
+        job_dir = f"./data/jobs/{job.id}"
+        os.makedirs(job_dir, exist_ok=True)
+        filepath = os.path.join(job_dir, file.filename)
+        with open(filepath, "wb") as f:
+            f.write(content)
+            
+        job_file = JobFile(
+            job_id=job.id,
+            filename=file.filename,
+            filepath=filepath
+        )
+        session.add(job_file)
+        session.commit()
+
         # ── Enqueue for background processing ──
         worker: Worker = request.app.state.worker
-        job = Job(
-            document_id=document_id,
-            file_content=content,
-            filename=file.filename,
-        )
         try:
-            await worker.enqueue(job)
+            await worker.enqueue_job_id(job.id)
         except asyncio.QueueFull:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

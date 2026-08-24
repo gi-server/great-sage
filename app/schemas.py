@@ -69,3 +69,27 @@ class HealthResponse(BaseModel):
     status: str
     tesseract: str
     ollama: str
+
+# ---------------------------------------------------------------------------
+# V2 Job API Models
+# ---------------------------------------------------------------------------
+
+import uuid
+from typing import List
+from datetime import datetime
+
+class JobFileResponse(BaseModel):
+    id: uuid.UUID
+    filename: str
+    status: str
+    ocr_text: Optional[str] = None
+    ai_result: Optional[str] = None
+    error_message: Optional[str] = None
+
+class JobResponse(BaseModel):
+    id: uuid.UUID
+    status: str
+    context: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    files: List[JobFileResponse] = []
