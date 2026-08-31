@@ -118,7 +118,7 @@ class TestAppStructure:
         import app.worker
 
     def test_routes_registered(self, app):
-        routes = {r.path for r in app.routes}
+        routes = {getattr(r, "path", "") for r in app.routes}
         assert "/api/v1/analyze" in routes
         assert "/health" in routes
 

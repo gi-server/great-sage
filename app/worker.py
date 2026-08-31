@@ -1,22 +1,19 @@
 """
 Async background worker for document processing.
 
-Uses an asyncio.Queue to decouple request acceptance (HTTP 202) from
-the actual processing pipeline. A single consumer loop runs as a
-long-lived asyncio task.
-
-This is deliberately simple — no Redis/Celery dependency. For production
-scale-out, the queue abstraction can be swapped for a distributed broker.
+Now uses SQLModel database to track state and process multiple files per job.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+import uuid
 from typing import TYPE_CHECKING
-
-from app.pipeline import process_document
+from sqlmodel import Session
+from app.database import engine
+from app.models import Job, JobFile
+from app.pipeline import process_job, process_document
 
 if TYPE_CHECKING:
     from app.config import Settings
@@ -24,20 +21,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger("great_sage.worker")
 
 
-@dataclass
-class Job:
-    """A unit of work placed on the processing queue."""
-    document_id: int
-    file_content: bytes
-    filename: str
-
-
 class Worker:
-    """Async task queue backed by asyncio.Queue."""
+    """Async task queue backed by asyncio.Queue for Job IDs."""
 
     def __init__(self, settings: "Settings") -> None:
         self._settings = settings
-        self._queue: asyncio.Queue[Job] = asyncio.Queue(
+        self._queue: asyncio.Queue[uuid.UUID] = asyncio.Queue(
             maxsize=settings.worker_queue_size,
         )
         self._task: asyncio.Task | None = None
@@ -57,43 +46,53 @@ class Worker:
                 pass
             logger.info("Worker stopped")
 
-    async def enqueue(self, job: Job) -> None:
+    async def enqueue_job_id(self, job_id: uuid.UUID) -> None:
         """
         Add a job to the queue.
-
         Raises asyncio.QueueFull if the queue is at capacity
         (callers should return HTTP 503).
         """
-        self._queue.put_nowait(job)
-        logger.info(
-            "Enqueued document %d (%d bytes, queue_size=%d)",
-            job.document_id,
-            len(job.file_content),
-            self._queue.qsize(),
-        )
+        self._queue.put_nowait(job_id)
+        logger.info("Enqueued job %s (queue_size=%d)", job_id, self._queue.qsize())
+
+    async def enqueue(self, item) -> None:
+        """Backward-compatible enqueue alias."""
+        if isinstance(item, uuid.UUID):
+            await self.enqueue_job_id(item)
+        elif hasattr(item, "id"):
+            await self.enqueue_job_id(item.id)
+        else:
+            self._queue.put_nowait(item)
 
     async def _consume(self) -> None:
         """Long-lived consumer that processes jobs sequentially."""
         logger.info("Consumer loop started")
         while True:
             try:
-                job = await self._queue.get()
-                logger.info("Processing document %d", job.document_id)
-                try:
-                    await process_document(
-                        document_id=job.document_id,
-                        file_content=job.file_content,
-                        filename=job.filename,
-                        settings=self._settings,
-                    )
-                except Exception:
-                    # Pipeline should never raise, but be defensive
-                    logger.exception(
-                        "Unhandled error processing document %d",
-                        job.document_id,
-                    )
-                finally:
-                    self._queue.task_done()
+                item = await self._queue.get()
+                if isinstance(item, uuid.UUID):
+                    job_id = item
+                    logger.info("Processing job %s", job_id)
+                    try:
+                        await process_job(
+                            job_id=job_id,
+                            settings=self._settings,
+                        )
+                    except Exception:
+                        logger.exception("Unhandled error processing job %s", job_id)
+                elif hasattr(item, "document_id"):
+                    # Legacy direct job object
+                    logger.info("Processing legacy document %d", item.document_id)
+                    try:
+                        await process_document(
+                            document_id=item.document_id,
+                            file_content=item.file_content,
+                            filename=item.filename,
+                            settings=self._settings,
+                        )
+                    except Exception:
+                        logger.exception("Unhandled error processing legacy document")
+                self._queue.task_done()
             except asyncio.CancelledError:
                 logger.info("Consumer loop cancelled")
                 raise
