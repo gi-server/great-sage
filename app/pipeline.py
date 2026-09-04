@@ -14,8 +14,8 @@ from app.database import engine
 from app.llm import classify_document
 from app.ocr import extract_text
 from app.models import Job, JobFile
-from app.schemas import ClassificationResult, WebhookPayload
-from app.webhook import deliver_webhook
+from app.schemas import ClassificationResult, WebhookPayload, JobWebhookPayload, FileResult
+from app.webhook import deliver_webhook, deliver_job_webhook
 
 if TYPE_CHECKING:
     from app.config import Settings
@@ -170,3 +170,28 @@ async def process_job(
                 error_message=file.error_message
             )
             await deliver_webhook(payload, settings)
+            
+        # Fire V2 webhook if needed
+        if job.webhook_url:
+            file_results = []
+            for file in job.files:
+                file_classification = ClassificationResult()
+                if file.ai_result:
+                    file_classification = ClassificationResult(**json.loads(file.ai_result))
+                
+                file_results.append(
+                    FileResult(
+                        filename=file.filename,
+                        status="success" if file.status == "completed" else "failed",
+                        ocr_text=file.ocr_text,
+                        classification=file_classification,
+                        error_message=file.error_message
+                    )
+                )
+            
+            v2_payload = JobWebhookPayload(
+                job_id=str(job.id),
+                status="success" if job.status == "completed" else "failed",
+                files=file_results
+            )
+            await deliver_job_webhook(v2_payload, settings)
