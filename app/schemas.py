@@ -4,18 +4,11 @@ Typed request / response models for the Great Sage API and internal pipeline.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import uuid
+from datetime import datetime
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, Field
-
-
-# ---------------------------------------------------------------------------
-# API request (metadata fields sent alongside the uploaded file)
-# ---------------------------------------------------------------------------
-
-class AnalyzeRequest(BaseModel):
-    """Metadata expected as form fields on POST /api/v1/analyze."""
-    document_id: int = Field(..., description="Poneglyph document ID for correlation")
 
 
 # ---------------------------------------------------------------------------
@@ -150,7 +143,6 @@ class JobWebhookPayload(BaseModel):
     files: list[FileResult]
 
 
-
 # ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
@@ -160,13 +152,10 @@ class HealthResponse(BaseModel):
     tesseract: str
     ollama: str
 
-# ---------------------------------------------------------------------------
-# V2 Job API Models
-# ---------------------------------------------------------------------------
 
-import uuid
-from typing import List
-from datetime import datetime
+# ---------------------------------------------------------------------------
+# V2 Job API response models
+# ---------------------------------------------------------------------------
 
 class JobFileResponse(BaseModel):
     id: uuid.UUID
@@ -175,6 +164,7 @@ class JobFileResponse(BaseModel):
     ocr_text: Optional[str] = None
     ai_result: Optional[str] = None
     error_message: Optional[str] = None
+
 
 class JobResponse(BaseModel):
     id: uuid.UUID

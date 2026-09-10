@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import platform
 from typing import TYPE_CHECKING
 
@@ -33,7 +34,6 @@ ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg"}
 
 def is_allowed_file(filename: str) -> bool:
     """Check whether the filename extension is in the allowlist."""
-    import os
     ext = os.path.splitext(filename.lower())[1]
     return ext in ALLOWED_EXTENSIONS
 
