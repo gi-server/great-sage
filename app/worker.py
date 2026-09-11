@@ -12,7 +12,7 @@ import uuid
 from typing import TYPE_CHECKING
 from sqlmodel import Session
 from app.database import engine
-from app.models import Job, JobFile
+from app.models import Job
 from app.pipeline import process_job, process_document
 
 if TYPE_CHECKING:
