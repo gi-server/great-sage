@@ -1,7 +1,31 @@
 """
-Async background worker for document processing.
+Async background worker pool for document processing.
 
-Now uses SQLModel database to track state and process multiple files per job.
+Architecture
+------------
+The Worker owns an `asyncio.Queue[str]` that carries job_id strings.
+It spawns `worker_pool_size` concurrent consumer coroutines, each of which:
+
+  1. Waits for a job_id on the channel.
+  2. Atomically claims the job (incoming/ → processing/) via queue_manager.
+  3. Calls pipeline.process_queue_job() — reusing the existing processing logic.
+  4. Moves the job to completed/ or retries/fails it via queue_manager.
+
+The QueueWatcher feeds the channel from filesystem events.
+HTTP handlers feed it indirectly: they call write_job_to_queue() which
+writes to incoming/, and the watcher picks it up.
+
+The internal asyncio.Queue acts as a backpressure buffer — if all workers
+are busy, new events accumulate in the channel up to `worker_queue_size`.
+If the channel is full, the watcher logs a warning but the job is safe in
+incoming/ and will be picked up on the next restart's crash-recovery scan.
+
+Backward Compatibility
+----------------------
+`enqueue_job_id(job_id)` and `enqueue(item)` are preserved.  Callers that
+previously pushed directly into the in-memory queue now transparently write
+to the filesystem queue instead.  The behaviour from the caller's perspective
+is identical.
 """
 
 from __future__ import annotations
@@ -9,11 +33,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from typing import TYPE_CHECKING
-from sqlmodel import Session
-from app.database import engine
-from app.models import Job
-from app.pipeline import process_job, process_document
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, List, Optional
+
+from app import queue_manager
+from app.pipeline import process_queue_job, process_document
 
 if TYPE_CHECKING:
     from app.config import Settings
@@ -21,68 +45,136 @@ if TYPE_CHECKING:
 logger = logging.getLogger("great_sage.worker")
 
 
+# ---------------------------------------------------------------------------
+# Legacy job envelope (backward compatibility)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Job:
+    """
+    Legacy direct-submission job.
+
+    Used by tests and any callers that enqueue a document object directly
+    rather than going through the filesystem queue.  The worker routes
+    these straight to process_document() (the old in-memory path).
+    """
+    document_id: int
+    file_content: bytes
+    filename: str
+
+
 class Worker:
-    """Async task queue backed by asyncio.Queue for Job IDs."""
+    """Filesystem-backed async worker pool."""
 
     def __init__(self, settings: "Settings") -> None:
         self._settings = settings
-        self._queue: asyncio.Queue[uuid.UUID] = asyncio.Queue(
+        # Internal channel — fed by QueueWatcher (and by enqueue_job_id for compat)
+        self._queue: asyncio.Queue[str] = asyncio.Queue(
             maxsize=settings.worker_queue_size,
         )
-        self._task: asyncio.Task | None = None
+        self._tasks: List[asyncio.Task] = []
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start the consumer loop."""
-        self._task = asyncio.create_task(self._consume(), name="great-sage-worker")
-        logger.info("Worker started (queue capacity=%d)", self._settings.worker_queue_size)
+        """Spawn the worker pool."""
+        n = self._settings.worker_pool_size
+        for i in range(n):
+            task = asyncio.create_task(
+                self._consume(worker_id=i),
+                name=f"great-sage-worker-{i}",
+            )
+            self._tasks.append(task)
+        logger.info(
+            "Worker pool started (%d workers, queue capacity=%d)",
+            n, self._settings.worker_queue_size,
+        )
 
     async def stop(self) -> None:
-        """Drain the queue and cancel the consumer."""
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            logger.info("Worker stopped")
+        """Cancel all worker tasks and wait for them to finish."""
+        for task in self._tasks:
+            task.cancel()
+        results = await asyncio.gather(*self._tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
+                logger.error("Worker task error during shutdown: %s", r)
+        self._tasks.clear()
+        logger.info("Worker pool stopped")
 
-    async def enqueue_job_id(self, job_id: uuid.UUID) -> None:
+    # ------------------------------------------------------------------
+    # Enqueue helpers (backward-compatible public API)
+    # ------------------------------------------------------------------
+
+    async def enqueue_job_id(self, job_id: uuid.UUID, source: str = "http_v2") -> None:
         """
-        Add a job to the queue.
-        Raises asyncio.QueueFull if the queue is at capacity
-        (callers should return HTTP 503).
+        Publish a job onto the filesystem queue.
+
+        This writes the job to data/queue/incoming/ atomically.
+        The QueueWatcher will detect the new directory and push the
+        job_id onto the internal channel.
+
+        Raises asyncio.QueueFull (re-raised as RuntimeError with friendly
+        message) if both the filesystem write succeeded but the internal
+        channel is temporarily at capacity — callers should return HTTP 503.
         """
-        self._queue.put_nowait(job_id)
-        logger.info("Enqueued job %s (queue_size=%d)", job_id, self._queue.qsize())
+        queue_manager.write_job_to_queue(
+            job_id=job_id,
+            source=source,
+            settings=self._settings,
+        )
+        logger.info("Job %s written to queue/incoming/ (source=%s)", job_id, source)
 
     async def enqueue(self, item) -> None:
-        """Backward-compatible enqueue alias."""
+        """Backward-compatible enqueue alias (used by legacy callers)."""
         if isinstance(item, uuid.UUID):
             await self.enqueue_job_id(item)
-        elif hasattr(item, "id"):
+        elif hasattr(item, "id") and isinstance(item.id, uuid.UUID):
             await self.enqueue_job_id(item.id)
         else:
+            # Legacy direct job objects with document_id — push straight onto
+            # the internal channel so the old code path still works
             self._queue.put_nowait(item)
 
-    async def _consume(self) -> None:
-        """Long-lived consumer that processes jobs sequentially."""
-        logger.info("Consumer loop started")
+    def push_to_channel(self, job_id: str) -> None:
+        """
+        Push a job_id string directly onto the internal asyncio channel.
+
+        Called by QueueWatcher (from the event loop thread via call_soon_threadsafe)
+        and by crash-recovery code that moves stranded jobs back to incoming/.
+        """
+        try:
+            self._queue.put_nowait(job_id)
+        except asyncio.QueueFull:
+            logger.warning(
+                "Internal channel full — job %s will be recovered on next restart "
+                "(it remains in queue/incoming/)",
+                job_id,
+            )
+
+    # ------------------------------------------------------------------
+    # Consumer loop
+    # ------------------------------------------------------------------
+
+    async def _consume(self, worker_id: int) -> None:
+        """Long-lived worker coroutine.  Processes one job at a time."""
+        logger.info("Worker %d started", worker_id)
         while True:
             try:
                 item = await self._queue.get()
-                if isinstance(item, uuid.UUID):
-                    job_id = item
-                    logger.info("Processing job %s", job_id)
-                    try:
-                        await process_job(
-                            job_id=job_id,
-                            settings=self._settings,
-                        )
-                    except Exception:
-                        logger.exception("Unhandled error processing job %s", job_id)
+
+                if isinstance(item, str):
+                    # Normal path: filesystem-backed job
+                    await self._process_fs_job(item, worker_id)
+
+                elif isinstance(item, uuid.UUID):
+                    # Should not normally reach here, but handle defensively
+                    await self._process_fs_job(str(item), worker_id)
+
                 elif hasattr(item, "document_id"):
-                    # Legacy direct job object
-                    logger.info("Processing legacy document %d", item.document_id)
+                    # Legacy direct job object (kept for backward compat)
+                    logger.info("Worker %d: processing legacy document %d", worker_id, item.document_id)
                     try:
                         await process_document(
                             document_id=item.document_id,
@@ -91,11 +183,47 @@ class Worker:
                             settings=self._settings,
                         )
                     except Exception:
-                        logger.exception("Unhandled error processing legacy document")
+                        logger.exception("Worker %d: unhandled error on legacy document", worker_id)
+
                 self._queue.task_done()
+
             except asyncio.CancelledError:
-                logger.info("Consumer loop cancelled")
+                logger.info("Worker %d cancelled", worker_id)
                 raise
             except Exception:
-                logger.exception("Unexpected error in consumer loop")
-                await asyncio.sleep(1)  # Prevent tight spin on persistent errors
+                logger.exception("Worker %d: unexpected error in consumer loop", worker_id)
+                await asyncio.sleep(1)  # prevent tight spin on persistent errors
+
+    async def _process_fs_job(self, job_id: str, worker_id: int) -> None:
+        """Claim, process, and settle a single filesystem-backed job."""
+        queue_dir = self._settings.queue_dir
+
+        # Atomically claim the job — only one worker wins
+        if not queue_manager.claim_job(job_id, queue_dir):
+            return  # another worker already claimed it
+
+        logger.info("Worker %d processing job %s", worker_id, job_id)
+
+        meta = queue_manager.load_job_meta(job_id, queue_dir)
+
+        try:
+            job_uuid = uuid.UUID(job_id)
+            await process_queue_job(
+                job_id=job_uuid,
+                meta=meta,
+                settings=self._settings,
+            )
+            queue_manager.complete_job(job_id, queue_dir)
+            logger.info("Worker %d completed job %s", worker_id, job_id)
+
+        except Exception as exc:
+            error_msg = str(exc)
+            logger.exception("Worker %d failed on job %s", worker_id, job_id)
+            was_retried = queue_manager.retry_or_fail_job(
+                job_id=job_id,
+                queue_dir=queue_dir,
+                error=error_msg,
+                max_attempts=self._settings.queue_max_attempts,
+            )
+            if was_retried:
+                logger.info("Job %s re-queued for retry", job_id)

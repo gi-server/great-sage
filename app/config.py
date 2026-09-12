@@ -36,6 +36,11 @@ class Settings:
 
     # --- Worker ---
     worker_queue_size: int = field(default=64)
+    worker_pool_size: int = field(default=4)
+
+    # --- Filesystem queue ---
+    queue_dir: str = field(default="./data/queue")
+    queue_max_attempts: int = field(default=3)
 
     def validate(self) -> list[str]:
         """Return a list of configuration problems (empty = OK)."""
@@ -63,4 +68,7 @@ def load_settings() -> Settings:
         max_llm_input_chars=int(os.getenv("MAX_LLM_INPUT_CHARS", "3000")),
         max_ai_string_length=int(os.getenv("MAX_AI_STRING_LENGTH", "255")),
         worker_queue_size=int(os.getenv("WORKER_QUEUE_SIZE", "64")),
+        worker_pool_size=int(os.getenv("WORKER_POOL_SIZE", "4")),
+        queue_dir=os.getenv("QUEUE_DIR", "./data/queue"),
+        queue_max_attempts=int(os.getenv("QUEUE_MAX_ATTEMPTS", "3")),
     )
