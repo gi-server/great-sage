@@ -26,6 +26,8 @@ from app.worker import Worker
 from app.database import init_db, get_session
 from app.routers import jobs
 from app.models import Job, JobFile
+from app.queue_manager import ensure_queue_dirs, scan_stranded_jobs
+from app.queue_watcher import QueueWatcher
 from sqlmodel import Session
 
 logger = logging.getLogger("great_sage")
@@ -36,16 +38,43 @@ logger = logging.getLogger("great_sage")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup / shutdown lifecycle for the worker."""
+    """Startup / shutdown lifecycle for the worker and queue watcher."""
     settings: Settings = app.state.settings
     init_db()
-    
+
+    # ── Queue directories ──
+    ensure_queue_dirs(settings.queue_dir)
+
+    # ── Worker pool ──
     worker = Worker(settings)
     app.state.worker = worker
     await worker.start()
-    
+
+    # ── Crash recovery: stale processing/ jobs from a previous run ──
+    recovered = scan_stranded_jobs(
+        queue_dir=settings.queue_dir,
+        max_attempts=settings.queue_max_attempts,
+    )
+    if recovered:
+        logger.info(
+            "Crash recovery: %d stranded job(s) moved back to incoming/: %s",
+            len(recovered), recovered,
+        )
+
+    # ── Filesystem watcher ──
+    loop = asyncio.get_event_loop()
+    watcher = QueueWatcher(
+        settings=settings,
+        queue=worker._queue,
+        loop=loop,
+    )
+    watcher.start()
+    app.state.watcher = watcher
+
     logger.info("Great Sage is ready")
     yield
+
+    watcher.stop()
     await worker.stop()
     logger.info("Great Sage shut down")
 
@@ -147,14 +176,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session.add(job_file)
         session.commit()
 
-        # ── Enqueue for background processing ──
+        # ── Enqueue for background processing (via filesystem queue) ──
         worker: Worker = request.app.state.worker
         try:
-            await worker.enqueue_job_id(job.id)
-        except asyncio.QueueFull:
+            await worker.enqueue_job_id(job.id, source="http_v1")
+        except Exception:
+            logger.exception("Failed to write job to filesystem queue")
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Processing queue is full. Please retry later.",
+                detail="Processing queue is temporarily unavailable. Please retry later.",
             )
 
         return AcceptedResponse(document_id=document_id)

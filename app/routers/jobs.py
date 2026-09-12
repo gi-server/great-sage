@@ -56,12 +56,12 @@ async def create_job(
     session.commit()
     session.refresh(job)
 
-    # Enqueue job ID
+    # Enqueue job via filesystem queue
     worker: Worker = request.app.state.worker
     try:
-        await worker.enqueue_job_id(job.id)
+        await worker.enqueue_job_id(job.id, source="http_v2")
     except Exception as e:
-        raise HTTPException(status_code=503, detail="Processing queue is full. Please retry later.")
+        raise HTTPException(status_code=503, detail="Processing queue is temporarily unavailable. Please retry later.")
     
     return job
 
