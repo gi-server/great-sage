@@ -8,8 +8,11 @@ It spawns `worker_pool_size` concurrent consumer coroutines, each of which:
 
   1. Waits for a job_id on the channel.
   2. Atomically claims the job (incoming/ → processing/) via queue_manager.
-  3. Calls pipeline.process_queue_job() — reusing the existing processing logic.
-  4. Moves the job to completed/ or retries/fails it via queue_manager.
+  3. Appends a 'processing_started' lifecycle event to the job metadata.
+  4. Fires a process-started HTTP callback to Poneglyph (best-effort).
+  5. Calls pipeline.process_job() — the core OCR/LLM/webhook pipeline.
+  6. Records callback outcome in metadata (callback_delivered / callback_attempts).
+  7. Moves the job to completed/ or retries/fails it via queue_manager.
 
 The QueueWatcher feeds the channel from filesystem events.
 HTTP handlers feed it indirectly: they call write_job_to_queue() which
@@ -37,7 +40,8 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 from app import queue_manager
-from app.pipeline import process_queue_job, process_document
+from app.pipeline import process_document, process_job
+from app.webhook import deliver_processing_started_callback
 
 if TYPE_CHECKING:
     from app.config import Settings
@@ -126,6 +130,33 @@ class Worker:
         )
         logger.info("Job %s written to queue/incoming/ (source=%s)", job_id, source)
 
+    async def enqueue_job_id_with_meta(
+        self,
+        job_id: uuid.UUID,
+        source: str,
+        original_filename: str,
+        poneglyph_file_path: str,
+        callback_url: Optional[str] = None,
+    ) -> None:
+        """
+        Publish a job with full lifecycle metadata onto the filesystem queue.
+
+        Used by the HTTP handlers (V1 and V2) to pass filename and
+        Poneglyph file reference for the lifecycle audit trail.
+        """
+        queue_manager.write_job_to_queue(
+            job_id=job_id,
+            source=source,
+            settings=self._settings,
+            original_filename=original_filename,
+            poneglyph_file_path=poneglyph_file_path,
+            callback_url=callback_url,
+        )
+        logger.info(
+            "Job %s written to queue/incoming/ (source=%s, file=%s)",
+            job_id, source, original_filename,
+        )
+
     async def enqueue(self, item) -> None:
         """Backward-compatible enqueue alias (used by legacy callers)."""
         if isinstance(item, uuid.UUID):
@@ -174,7 +205,9 @@ class Worker:
 
                 elif hasattr(item, "document_id"):
                     # Legacy direct job object (kept for backward compat)
-                    logger.info("Worker %d: processing legacy document %d", worker_id, item.document_id)
+                    logger.info(
+                        "Worker %d: processing legacy document %d", worker_id, item.document_id
+                    )
                     try:
                         await process_document(
                             document_id=item.document_id,
@@ -183,7 +216,9 @@ class Worker:
                             settings=self._settings,
                         )
                     except Exception:
-                        logger.exception("Worker %d: unhandled error on legacy document", worker_id)
+                        logger.exception(
+                            "Worker %d: unhandled error on legacy document", worker_id
+                        )
 
                 self._queue.task_done()
 
@@ -198,21 +233,66 @@ class Worker:
         """Claim, process, and settle a single filesystem-backed job."""
         queue_dir = self._settings.queue_dir
 
-        # Atomically claim the job — only one worker wins
+        # ── 1. Atomically claim the job — only one worker wins ──────────────
         if not queue_manager.claim_job(job_id, queue_dir):
             return  # another worker already claimed it
 
         logger.info("Worker %d processing job %s", worker_id, job_id)
 
+        # ── 2. Load metadata (for callback_url and attempt count) ────────────
         meta = queue_manager.load_job_meta(job_id, queue_dir)
+        attempt = (meta.attempt if meta else 0) + 1
 
+        # ── 3. Record processing_started lifecycle event ─────────────────────
+        queue_manager.append_lifecycle_event(
+            job_id, queue_dir, "processing_started",
+            detail=f"Worker {worker_id}, attempt {attempt}",
+        )
+
+        # ── 4. Fire process-started callback to Poneglyph (best-effort) ──────
         try:
-            job_uuid = uuid.UUID(job_id)
-            await process_queue_job(
-                job_id=job_uuid,
-                meta=meta,
+            started_ok = await deliver_processing_started_callback(
+                job_id=job_id,
+                attempt=attempt,
                 settings=self._settings,
             )
+            if started_ok:
+                queue_manager.append_lifecycle_event(
+                    job_id, queue_dir, "callback_sent",
+                    detail="process-started callback delivered",
+                )
+            else:
+                queue_manager.append_lifecycle_event(
+                    job_id, queue_dir, "callback_failed",
+                    detail="process-started callback failed (processing continues)",
+                )
+        except Exception:
+            logger.exception("Worker %d: exception during process-started callback", worker_id)
+
+        # ── 5. Run OCR → LLM → DB → completion webhook ──────────────────────
+        try:
+            job_uuid = uuid.UUID(job_id)
+            result = await process_job(
+                job_id=job_uuid,
+                settings=self._settings,
+            )
+
+            # process_job returns (all_success, callback_ok) when webhook_url set,
+            # or just bool for backwards compat with the legacy V1 path.
+            if isinstance(result, tuple):
+                _all_success, callback_ok = result
+            else:
+                callback_ok = True  # V1/no-webhook path — no completion callback to track
+
+            # ── 6. Record completion callback outcome in metadata ────────────
+            if callback_ok:
+                queue_manager.mark_callback_delivered(job_id, queue_dir)
+            else:
+                queue_manager.increment_callback_attempts(
+                    job_id, queue_dir, error="Completion callback delivery failed"
+                )
+
+            # ── 7. Move job to completed/ ────────────────────────────────────
             queue_manager.complete_job(job_id, queue_dir)
             logger.info("Worker %d completed job %s", worker_id, job_id)
 

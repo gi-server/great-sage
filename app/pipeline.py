@@ -4,20 +4,19 @@ End-to-end document processing pipeline.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
-import json
 from typing import TYPE_CHECKING
+
 from sqlmodel import Session, select
 
 from app.database import engine
 from app.llm import classify_document
-from app.ocr import extract_text
 from app.models import Job, JobFile
-from app.schemas import ClassificationResult, WebhookPayload, JobWebhookPayload, FileResult
-from app.webhook import deliver_webhook, deliver_job_webhook
-from app import trie_store
-from app.queue_manager import JobMeta
+from app.ocr import extract_text
+from app.schemas import ClassificationResult, FileResult, JobWebhookPayload, WebhookPayload
+from app.webhook import deliver_job_webhook, deliver_webhook
 
 if TYPE_CHECKING:
     from app.config import Settings
@@ -93,7 +92,7 @@ async def process_document(
 async def process_job(
     job_id: uuid.UUID,
     settings: "Settings",
-) -> None:
+) -> bool:
     """
     Process all files within a job.
 
@@ -102,11 +101,14 @@ async def process_job(
     file, rather than committing after every individual field update.
     Cancellation is checked once per file iteration without an extra
     session.refresh() round-trip inside the loop.
+
+    Returns True if all files succeeded, False if any file failed.
+    The caller (worker) is responsible for moving the job in the queue.
     """
     with Session(engine) as session:
         job = session.get(Job, job_id)
         if not job or job.status == "cancelled":
-            return
+            return False
 
         # Eagerly load all file records so we don't re-query inside the loop
         files = session.exec(select(JobFile).where(JobFile.job_id == job_id)).all()
@@ -124,7 +126,7 @@ async def process_job(
                 select(Job.status).where(Job.id == job_id)
             ).one()
             if current_status == "cancelled":
-                return
+                return False
 
             file.status = "processing"
 
@@ -157,7 +159,9 @@ async def process_job(
                 file.ai_result = classification.model_dump_json()
                 file.status = "completed"
             except Exception as exc:
-                logger.exception("AI classification failed for file %s in job %s", file.filename, job_id)
+                logger.exception(
+                    "AI classification failed for file %s in job %s", file.filename, job_id
+                )
                 file.status = "failed"
                 file.error_message = f"AI classification failed: {exc}"
                 all_success = False
@@ -174,15 +178,15 @@ async def process_job(
         if job.legacy_document_id and files:
             first_file = files[0]
             status_str = "success" if first_file.status == "completed" else "failed"
-            classification = ClassificationResult()
+            classification_result = ClassificationResult()
             if first_file.ai_result:
-                classification = ClassificationResult(**json.loads(first_file.ai_result))
+                classification_result = ClassificationResult(**json.loads(first_file.ai_result))
 
             payload = WebhookPayload(
                 document_id=job.legacy_document_id,
                 status=status_str,
                 ocr_text=first_file.ocr_text,
-                classification=classification,
+                classification=classification_result,
                 error_message=first_file.error_message,
             )
             await deliver_webhook(payload, settings)
@@ -210,85 +214,7 @@ async def process_job(
                 status="success" if job.status == "completed" else "failed",
                 files=file_results,
             )
-            await deliver_job_webhook(v2_payload, settings)
+            callback_ok = await deliver_job_webhook(v2_payload, settings, custom_url=job.webhook_url)
+            return all_success, callback_ok
 
-
-async def process_queue_job(
-    job_id: uuid.UUID,
-    meta: "JobMeta | None",
-    settings: "Settings",
-) -> None:
-    """
-    Wrapper around process_job() that additionally persists results to the
-    person-centric trie store.
-
-    This is called by the filesystem-backed worker pool.  The existing
-    process_job() function is invoked unchanged; after it completes, we
-    read the AI results back out of SQLite and write them to
-    data/people/<person_id>/trie/.
-
-    Person resolution
-    -----------------
-    If the job metadata already carries a person_id (supplied by Poneglyph at
-    submission time), that is used directly.  Otherwise we use the LLM-extracted
-    person_name + dob to look up or create a person via trie_store.
-
-    Idempotency
-    -----------
-    trie_store.insert() checks whether this job_id has already been written
-    for the person before doing any work, so retries are safe.
-    """
-    # Run the core OCR / LLM / webhook pipeline (unchanged)
-    await process_job(job_id=job_id, settings=settings)
-
-    # Read back the results to persist into the trie
-    with Session(engine) as session:
-        job = session.get(Job, job_id)
-        if not job:
-            logger.warning("process_queue_job: job %s not found in DB after processing", job_id)
-            return
-
-        files = session.exec(select(JobFile).where(JobFile.job_id == job_id)).all()
-
-    job_id_str = str(job_id)
-
-    for file in files:
-        if file.status != "completed" or not file.ai_result:
-            continue
-
-        try:
-            ai = json.loads(file.ai_result)
-        except Exception:
-            logger.warning("process_queue_job: could not parse ai_result for file %s", file.id)
-            continue
-
-        person_name: str | None = ai.get("person_name") or (
-            ai.get("extracted_data", {}).get("person_name") if isinstance(ai.get("extracted_data"), dict) else None
-        )
-        dob: str | None = ai.get("dob") or (
-            ai.get("extracted_data", {}).get("dob") if isinstance(ai.get("extracted_data"), dict) else None
-        )
-
-        if not person_name:
-            logger.debug(
-                "process_queue_job: no person_name extracted for job %s file %s — skipping trie write",
-                job_id_str, file.filename,
-            )
-            continue
-
-        # Resolve person_id
-        if meta and meta.person_id:
-            person_id = meta.person_id
-        else:
-            person_id = trie_store.get_or_create_person(person_name, dob)
-
-        # Persist to trie (idempotent)
-        trie_store.insert(
-            person_id=person_id,
-            person_name=person_name,
-            extracted_data=ai,
-            job_id=job_id_str,
-            dob=dob,
-        )
-
-    logger.info("process_queue_job: trie update complete for job %s", job_id_str)
+    return all_success, True

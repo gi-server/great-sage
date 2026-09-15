@@ -9,6 +9,7 @@ from app.models import Job, JobFile
 from app.schemas import JobResponse, JobFileResponse
 from app.worker import Worker
 from app.auth import verify_api_key
+from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/v2/jobs", tags=["jobs"])
 
@@ -62,8 +63,34 @@ async def create_job(
         await worker.enqueue_job_id(job.id, source="http_v2")
     except Exception as e:
         raise HTTPException(status_code=503, detail="Processing queue is temporarily unavailable. Please retry later.")
-    
+        
     return job
+
+class JobQueryRequest(BaseModel):
+    status: Optional[str] = None
+    limit: int = 100
+    offset: int = 0
+
+@router.api_route("", methods=["GET", "QUERY"], response_model=List[JobResponse])
+def list_jobs(
+    status: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    body: Optional[JobQueryRequest] = None,
+    session: Session = Depends(get_session)
+):
+    # Support parameters from either query string or request body (for QUERY method)
+    query_status = body.status if body and body.status else status
+    query_limit = body.limit if body and body.limit != 100 else limit
+    query_offset = body.offset if body and body.offset != 0 else offset
+
+    query = select(Job)
+    if query_status:
+        query = query.where(Job.status == query_status)
+    
+    query = query.offset(query_offset).limit(query_limit).order_by(Job.created_at.desc())
+    jobs = session.exec(query).all()
+    return jobs
 
 @router.get("/{job_id}", response_model=JobResponse)
 def get_job(job_id: uuid.UUID, session: Session = Depends(get_session)):

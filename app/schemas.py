@@ -173,3 +173,41 @@ class JobResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     files: List[JobFileResponse] = []
+
+
+# ---------------------------------------------------------------------------
+# QUERY /api/v2/jobs/{job_id} — filesystem queue lifecycle response
+# ---------------------------------------------------------------------------
+
+class LifecycleEventSchema(BaseModel):
+    """A single timestamped event in a job's processing history."""
+    event: str
+    timestamp: str
+    detail: Optional[str] = None
+
+
+class JobQueryResponse(BaseModel):
+    """
+    Response to QUERY /api/v2/jobs/{job_id}.
+
+    Reads from the filesystem queue metadata (not from SQLite) so it reflects
+    the live queue state including lifecycle events, callback delivery status,
+    and the original Poneglyph file reference.
+
+    This is strictly read-only — it never moves, retries, or claims jobs.
+    """
+    job_id: str
+    source: str
+    original_filename: str
+    poneglyph_file_path: str
+    document_path: str
+    status: str
+    attempt: int
+    max_attempts: int
+    created_at: str
+    enqueued_at: str
+    error: Optional[str] = None
+    callback_url: Optional[str] = None
+    callback_delivered: bool
+    callback_attempts: int
+    lifecycle: List[LifecycleEventSchema] = []

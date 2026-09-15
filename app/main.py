@@ -179,7 +179,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # ── Enqueue for background processing (via filesystem queue) ──
         worker: Worker = request.app.state.worker
         try:
-            await worker.enqueue_job_id(job.id, source="http_v1")
+            await worker.enqueue_job_id_with_meta(
+                job_id=job.id,
+                source="http_v1",
+                original_filename=file.filename,
+                # For V1, Poneglyph sends the document_id as a form field.
+                # We encode it as the canonical Poneglyph file reference.
+                poneglyph_file_path=f"poneglyph://document/{document_id}/{file.filename}",
+                callback_url=None,  # V1 uses the global PONEGLYPH_WEBHOOK_URL
+            )
         except Exception:
             logger.exception("Failed to write job to filesystem queue")
             raise HTTPException(
