@@ -5,7 +5,7 @@ watchdog runs its observer in a daemon thread that emits events synchronously.
 We bridge to asyncio using `loop.call_soon_threadsafe()` so the asyncio queue
 is only ever touched from the event loop thread.
 
-Only `DirCreatedEvent` events under `queue/incoming/` are acted on — each
+Only `DirCreatedEvent` events under `queue/intake/` are acted on — each
 new directory there represents a fully written, atomically placed job.
 """
 
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger("great_sage.queue_watcher")
 
 
-class _IncomingHandler(FileSystemEventHandler):
+class _IntakeHandler(FileSystemEventHandler):
     """
     watchdog event handler.
 
@@ -53,7 +53,7 @@ class _IncomingHandler(FileSystemEventHandler):
             logger.debug("Ignoring non-UUID directory event: %s", job_id)
             return
 
-        logger.info("Watcher detected new job: %s", job_id)
+        logger.info("Watcher detected new job in intake/: %s", job_id)
 
         # Thread-safe handoff to the asyncio event loop
         self._loop.call_soon_threadsafe(self._enqueue, job_id)
@@ -66,7 +66,7 @@ class _IncomingHandler(FileSystemEventHandler):
         except asyncio.QueueFull:
             logger.error(
                 "Internal channel full — dropping watcher event for job %s. "
-                "The job is still in incoming/ and will be recovered on restart.",
+                "The job is still in intake/ and will be recovered on restart.",
                 job_id,
             )
 
@@ -95,14 +95,14 @@ class QueueWatcher:
         self._observer: Observer | None = None
 
     def start(self) -> None:
-        incoming_path = Path(self._settings.queue_dir) / "incoming"
-        incoming_path.mkdir(parents=True, exist_ok=True)
+        intake_path = Path(self._settings.queue_dir) / "intake"
+        intake_path.mkdir(parents=True, exist_ok=True)
 
-        handler = _IncomingHandler(loop=self._loop, queue=self._queue)
+        handler = _IntakeHandler(loop=self._loop, queue=self._queue)
         self._observer = Observer()
-        self._observer.schedule(handler, str(incoming_path), recursive=False)
+        self._observer.schedule(handler, str(intake_path), recursive=False)
         self._observer.start()
-        logger.info("QueueWatcher started — watching %s", incoming_path)
+        logger.info("QueueWatcher started — watching %s", intake_path)
 
     def stop(self) -> None:
         if self._observer is not None:

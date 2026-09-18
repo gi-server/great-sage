@@ -5,7 +5,6 @@ DATABASE_URL = "sqlite:///./data/great_sage.db"
 
 # Ensure data directory exists
 os.makedirs("./data", exist_ok=True)
-os.makedirs("./data/jobs", exist_ok=True)
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 

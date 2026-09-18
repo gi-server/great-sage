@@ -169,10 +169,33 @@ class JobFileResponse(BaseModel):
 class JobResponse(BaseModel):
     id: uuid.UUID
     status: str
+    source: str = "unknown"
+    raw_data: Optional[str] = None
     context: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     files: List[JobFileResponse] = []
+
+
+class JobEventSchema(BaseModel):
+    """A single stage-transition event in a job's live processing log."""
+    event: str              # enqueued | claimed | processing_started | ocr_done | ai_done | completed | retried | failed | recovered
+    file_status: str        # Job.status at the time this event was written
+    source: str             # originating application, e.g. "poneglyph:8080"
+    raw_data: Optional[str] = None   # OCR text snapshot at this point (None until OCR runs)
+    detail: Optional[str] = None
+    timestamp: datetime
+
+
+class JobDetailResponse(JobResponse):
+    """
+    Extended job response returned by GET /api/v2/jobs/{job_id}.
+
+    Includes the full chronological processing event log from SQLite,
+    enabling Postman / clients to see live status, OCR text, and
+    per-stage timestamps without touching the filesystem.
+    """
+    events: List[JobEventSchema] = []
 
 
 # ---------------------------------------------------------------------------

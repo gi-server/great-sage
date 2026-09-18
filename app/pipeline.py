@@ -7,13 +7,15 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from typing import TYPE_CHECKING
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Optional
 
 from sqlmodel import Session, select
 
 from app.database import engine
 from app.llm import classify_document
-from app.models import Job, JobFile
+from app.models import Job, JobFile, JobEvent
 from app.ocr import extract_text
 from app.schemas import ClassificationResult, FileResult, JobWebhookPayload, WebhookPayload
 from app.webhook import deliver_job_webhook, deliver_webhook
@@ -22,6 +24,32 @@ if TYPE_CHECKING:
     from app.config import Settings
 
 logger = logging.getLogger("great_sage.pipeline")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _write_event(
+    session: Session,
+    job: Job,
+    event: str,
+    file_status: str,
+    raw_data: Optional[str] = None,
+    detail: Optional[str] = None,
+) -> None:
+    """Append a JobEvent row and commit."""
+    ev = JobEvent(
+        job_id=job.id,
+        event=event,
+        file_status=file_status,
+        source=job.source,
+        raw_data=raw_data,
+        detail=detail,
+        timestamp=_utcnow(),
+    )
+    session.add(ev)
+    session.commit()
 
 
 async def process_document(
@@ -96,46 +124,51 @@ async def process_job(
     """
     Process all files within a job.
 
-    Reads the job and all its files in a single query at the start.
-    Batches all per-file DB writes into a single commit at the end of each
-    file, rather than committing after every individual field update.
-    Cancellation is checked once per file iteration without an extra
-    session.refresh() round-trip inside the loop.
+    Files are read from their current location on disk — the worker leaves
+    them in queue/intake/<job_id>/ throughout processing.  On success the
+    worker (not this function) moves the folder to completed/.
 
-    Returns True if all files succeeded, False if any file failed.
-    The caller (worker) is responsible for moving the job in the queue.
+    Returns (all_success, callback_ok) tuple, or just all_success for the
+    legacy V1 path.
     """
     with Session(engine) as session:
         job = session.get(Job, job_id)
         if not job or job.status == "cancelled":
-            return False
+            return False, True
 
-        # Eagerly load all file records so we don't re-query inside the loop
+        # Eagerly load all file records
         files = session.exec(select(JobFile).where(JobFile.job_id == job_id)).all()
 
-        job.status = "processing"
-        session.add(job)
-        session.commit()
+        _write_event(session, job, "processing_started", "processing")
 
         all_success = True
 
         for file in files:
-            # Re-fetch just the job status to check for cancellation.
-            # This is a single-column read — significantly cheaper than refresh().
+            # Check for cancellation
             current_status = session.exec(
                 select(Job.status).where(Job.id == job_id)
             ).one()
             if current_status == "cancelled":
-                return False
+                return False, True
 
             file.status = "processing"
 
-            # OCR
+            # ── OCR ──────────────────────────────────────────────────────────
             try:
-                with open(file.filepath, "rb") as f:
+                file_path = Path(file.filepath)
+                if not file_path.exists():
+                    # Filepath may still reference old data/jobs path — try queue/intake
+                    queue_intake_path = (
+                        Path(settings.queue_dir) / "intake" / str(job_id) / file.filename
+                    )
+                    file_path = queue_intake_path
+
+                with open(file_path, "rb") as f:
                     file_content = f.read()
+
                 ocr_text = extract_text(file_content, file.filename, settings)
                 file.ocr_text = ocr_text
+
             except Exception as exc:
                 logger.exception("OCR failed for file %s in job %s", file.filename, job_id)
                 file.status = "failed"
@@ -153,11 +186,23 @@ async def process_job(
                 all_success = False
                 continue
 
-            # AI Classification
+            # Store raw OCR text on the Job row (first file wins for multi-file jobs)
+            if not job.raw_data:
+                job.raw_data = ocr_text
+                session.add(job)
+                session.commit()
+
+            _write_event(session, job, "ocr_done", "processing",
+                         raw_data=ocr_text[:500] if ocr_text else None,
+                         detail=f"File: {file.filename}")
+
+            # ── AI Classification ─────────────────────────────────────────────
             try:
                 classification = await classify_document(ocr_text, settings, context=job.context)
                 file.ai_result = classification.model_dump_json()
                 file.status = "completed"
+                _write_event(session, job, "ai_done", "processing",
+                             detail=f"File: {file.filename}, type: {classification.document_type}")
             except Exception as exc:
                 logger.exception(
                     "AI classification failed for file %s in job %s", file.filename, job_id
@@ -169,12 +214,10 @@ async def process_job(
             session.add(file)
             session.commit()
 
-        # Mark job terminal state
-        job.status = "completed" if all_success else "failed"
-        session.add(job)
-        session.commit()
+        # Note: job terminal status (completed/failed) is set by the worker,
+        # not here, so the worker can handle the folder rename atomically.
 
-        # Fire V1 legacy webhook if this was submitted via /api/v1/analyze
+        # ── V1 legacy webhook ─────────────────────────────────────────────────
         if job.legacy_document_id and files:
             first_file = files[0]
             status_str = "success" if first_file.status == "completed" else "failed"
@@ -191,7 +234,7 @@ async def process_job(
             )
             await deliver_webhook(payload, settings)
 
-        # Fire V2 webhook if a webhook_url was provided by the caller
+        # ── V2 webhook ────────────────────────────────────────────────────────
         if job.webhook_url:
             file_results = []
             for file in files:
@@ -211,7 +254,7 @@ async def process_job(
 
             v2_payload = JobWebhookPayload(
                 job_id=str(job.id),
-                status="success" if job.status == "completed" else "failed",
+                status="success" if all_success else "failed",
                 files=file_results,
             )
             callback_ok = await deliver_job_webhook(v2_payload, settings, custom_url=job.webhook_url)
