@@ -13,9 +13,11 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status, Depends
 from fastapi.responses import JSONResponse
+from sqlmodel import Session, select
 
 from app.auth import verify_api_key
 from app.config import Settings, load_settings
@@ -23,14 +25,60 @@ from app.llm import check_ollama
 from app.ocr import check_tesseract, is_allowed_file
 from app.schemas import AcceptedResponse, HealthResponse
 from app.worker import Worker
-from app.database import init_db, get_session
+from app.database import init_db, get_session, engine
 from app.routers import jobs
-from app.models import Job, JobFile
-from app.queue_manager import ensure_queue_dirs, scan_stranded_jobs
+from app.models import Job, JobEvent
+from app.queue_manager import ensure_queue_dirs
 from app.queue_watcher import QueueWatcher
-from sqlmodel import Session
 
 logger = logging.getLogger("great_sage")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Crash recovery via SQLite
+# ---------------------------------------------------------------------------
+
+def recover_stranded_jobs(worker: Worker) -> None:
+    """
+    On startup, reset any jobs stuck in 'processing' from a previous crashed run.
+
+    Their directories still exist in intake/ — the QueueWatcher will detect
+    them if they are re-added to the internal channel.  We reset status to
+    'pending' and push them onto the channel directly.
+    """
+    with Session(engine) as session:
+        stranded = session.exec(
+            select(Job).where(Job.status == "processing")
+        ).all()
+
+        if not stranded:
+            return
+
+        for job in stranded:
+            job.status = "pending"
+            job.updated_at = _utcnow()
+            ev = JobEvent(
+                job_id=job.id,
+                event="recovered",
+                file_status="pending",
+                source=job.source,
+                detail="Reset from 'processing' on startup (crash recovery)",
+                timestamp=_utcnow(),
+            )
+            session.add(job)
+            session.add(ev)
+            worker.push_to_channel(str(job.id))
+
+        session.commit()
+        logger.info(
+            "Crash recovery: %d stranded job(s) reset to pending: %s",
+            len(stranded), [str(j.id) for j in stranded],
+        )
+
 
 # ---------------------------------------------------------------------------
 # Application lifespan
@@ -50,16 +98,8 @@ async def lifespan(app: FastAPI):
     app.state.worker = worker
     await worker.start()
 
-    # ── Crash recovery: stale processing/ jobs from a previous run ──
-    recovered = scan_stranded_jobs(
-        queue_dir=settings.queue_dir,
-        max_attempts=settings.queue_max_attempts,
-    )
-    if recovered:
-        logger.info(
-            "Crash recovery: %d stranded job(s) moved back to incoming/: %s",
-            len(recovered), recovered,
-        )
+    # ── Crash recovery: jobs stuck in 'processing' from a previous run ──
+    recover_stranded_jobs(worker)
 
     # ── Filesystem watcher ──
     loop = asyncio.get_event_loop()
@@ -80,11 +120,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    """
-    Application factory.
-
-    Accepts an optional Settings override for testing.
-    """
+    """Application factory. Accepts an optional Settings override for testing."""
     if settings is None:
         settings = load_settings()
 
@@ -156,30 +192,51 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail="Uploaded file is empty",
             )
 
-        # ── Create job in DB ──
-        job = Job(legacy_document_id=document_id)
+        # ── Determine source ──
+        source = request.headers.get("X-Source", "poneglyph:8080")
+
+        # ── Create job in SQLite ──
+        job = Job(
+            legacy_document_id=document_id,
+            source=source,
+            status="pending",
+        )
         session.add(job)
         session.commit()
         session.refresh(job)
-        
-        job_dir = f"./data/jobs/{job.id}"
-        os.makedirs(job_dir, exist_ok=True)
-        filepath = os.path.join(job_dir, file.filename)
-        with open(filepath, "wb") as f:
-            f.write(content)
-            
+
+        # ── Create JobFile record ──
+        # filepath points to where it will land after queue_manager writes it
+        intake_path = f"{settings.queue_dir}/intake/{job.id}/{file.filename}"
+        from app.models import JobFile
         job_file = JobFile(
             job_id=job.id,
             filename=file.filename,
-            filepath=filepath
+            filepath=intake_path,
         )
         session.add(job_file)
+
+        # ── Write enqueued event ──
+        ev = JobEvent(
+            job_id=job.id,
+            event="enqueued",
+            file_status="pending",
+            source=source,
+            detail=f"document_id={document_id}, file={file.filename}",
+            timestamp=_utcnow(),
+        )
+        session.add(ev)
         session.commit()
 
-        # ── Enqueue for background processing (via filesystem queue) ──
+        # ── Write file to queue/intake/ ──
         worker: Worker = request.app.state.worker
         try:
-            await worker.enqueue_job_id(job.id, source="http_v1")
+            await worker.enqueue_job_id_with_meta(
+                job_id=job.id,
+                file_content=content,
+                filename=file.filename,
+                source=source,
+            )
         except Exception:
             logger.exception("Failed to write job to filesystem queue")
             raise HTTPException(
@@ -195,9 +252,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         summary="Service health check",
     )
     async def health(request: Request):
-        """
-        Verify service health including Tesseract and Ollama reachability.
-        """
+        """Verify service health including Tesseract and Ollama reachability."""
         settings: Settings = request.app.state.settings
 
         tesseract_ok = check_tesseract()
@@ -218,7 +273,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 
 # ---------------------------------------------------------------------------
-# Entrypoint for `python -m app.main` or `uvicorn app.main:app`
+# Entrypoint
 # ---------------------------------------------------------------------------
 
 app = create_app()

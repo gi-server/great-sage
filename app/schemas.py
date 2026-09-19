@@ -169,7 +169,68 @@ class JobFileResponse(BaseModel):
 class JobResponse(BaseModel):
     id: uuid.UUID
     status: str
+    source: str = "unknown"
+    raw_data: Optional[str] = None
     context: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     files: List[JobFileResponse] = []
+
+
+class JobEventSchema(BaseModel):
+    """A single stage-transition event in a job's live processing log."""
+    event: str              # enqueued | claimed | processing_started | ocr_done | ai_done | completed | retried | failed | recovered
+    file_status: str        # Job.status at the time this event was written
+    source: str             # originating application, e.g. "poneglyph:8080"
+    raw_data: Optional[str] = None   # OCR text snapshot at this point (None until OCR runs)
+    detail: Optional[str] = None
+    timestamp: datetime
+
+
+class JobDetailResponse(JobResponse):
+    """
+    Extended job response returned by GET /api/v2/jobs/{job_id}.
+
+    Includes the full chronological processing event log from SQLite,
+    enabling Postman / clients to see live status, OCR text, and
+    per-stage timestamps without touching the filesystem.
+    """
+    events: List[JobEventSchema] = []
+
+
+# ---------------------------------------------------------------------------
+# QUERY /api/v2/jobs/{job_id} — filesystem queue lifecycle response
+# ---------------------------------------------------------------------------
+
+class LifecycleEventSchema(BaseModel):
+    """A single timestamped event in a job's processing history."""
+    event: str
+    timestamp: str
+    detail: Optional[str] = None
+
+
+class JobQueryResponse(BaseModel):
+    """
+    Response to QUERY /api/v2/jobs/{job_id}.
+
+    Reads from the filesystem queue metadata (not from SQLite) so it reflects
+    the live queue state including lifecycle events, callback delivery status,
+    and the original Poneglyph file reference.
+
+    This is strictly read-only — it never moves, retries, or claims jobs.
+    """
+    job_id: str
+    source: str
+    original_filename: str
+    poneglyph_file_path: str
+    document_path: str
+    status: str
+    attempt: int
+    max_attempts: int
+    created_at: str
+    enqueued_at: str
+    error: Optional[str] = None
+    callback_url: Optional[str] = None
+    callback_delivered: bool
+    callback_attempts: int
+    lifecycle: List[LifecycleEventSchema] = []

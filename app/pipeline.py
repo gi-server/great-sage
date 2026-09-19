@@ -4,25 +4,52 @@ End-to-end document processing pipeline.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
-import json
-from typing import TYPE_CHECKING
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Optional
+
 from sqlmodel import Session, select
 
 from app.database import engine
 from app.llm import classify_document
+from app.models import Job, JobFile, JobEvent
 from app.ocr import extract_text
-from app.models import Job, JobFile
-from app.schemas import ClassificationResult, WebhookPayload, JobWebhookPayload, FileResult
-from app.webhook import deliver_webhook, deliver_job_webhook
-from app import trie_store
-from app.queue_manager import JobMeta
+from app.schemas import ClassificationResult, FileResult, JobWebhookPayload, WebhookPayload
+from app.webhook import deliver_job_webhook, deliver_webhook
 
 if TYPE_CHECKING:
     from app.config import Settings
 
 logger = logging.getLogger("great_sage.pipeline")
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _write_event(
+    session: Session,
+    job: Job,
+    event: str,
+    file_status: str,
+    raw_data: Optional[str] = None,
+    detail: Optional[str] = None,
+) -> None:
+    """Append a JobEvent row and commit."""
+    ev = JobEvent(
+        job_id=job.id,
+        event=event,
+        file_status=file_status,
+        source=job.source,
+        raw_data=raw_data,
+        detail=detail,
+        timestamp=_utcnow(),
+    )
+    session.add(ev)
+    session.commit()
 
 
 async def process_document(
@@ -93,47 +120,55 @@ async def process_document(
 async def process_job(
     job_id: uuid.UUID,
     settings: "Settings",
-) -> None:
+) -> bool:
     """
     Process all files within a job.
 
-    Reads the job and all its files in a single query at the start.
-    Batches all per-file DB writes into a single commit at the end of each
-    file, rather than committing after every individual field update.
-    Cancellation is checked once per file iteration without an extra
-    session.refresh() round-trip inside the loop.
+    Files are read from their current location on disk — the worker leaves
+    them in queue/intake/<job_id>/ throughout processing.  On success the
+    worker (not this function) moves the folder to completed/.
+
+    Returns (all_success, callback_ok) tuple, or just all_success for the
+    legacy V1 path.
     """
     with Session(engine) as session:
         job = session.get(Job, job_id)
         if not job or job.status == "cancelled":
-            return
+            return False, True
 
-        # Eagerly load all file records so we don't re-query inside the loop
+        # Eagerly load all file records
         files = session.exec(select(JobFile).where(JobFile.job_id == job_id)).all()
 
-        job.status = "processing"
-        session.add(job)
-        session.commit()
+        _write_event(session, job, "processing_started", "processing")
 
         all_success = True
 
         for file in files:
-            # Re-fetch just the job status to check for cancellation.
-            # This is a single-column read — significantly cheaper than refresh().
+            # Check for cancellation
             current_status = session.exec(
                 select(Job.status).where(Job.id == job_id)
             ).one()
             if current_status == "cancelled":
-                return
+                return False, True
 
             file.status = "processing"
 
-            # OCR
+            # ── OCR ──────────────────────────────────────────────────────────
             try:
-                with open(file.filepath, "rb") as f:
+                file_path = Path(file.filepath)
+                if not file_path.exists():
+                    # Filepath may still reference old data/jobs path — try queue/intake
+                    queue_intake_path = (
+                        Path(settings.queue_dir) / "intake" / str(job_id) / file.filename
+                    )
+                    file_path = queue_intake_path
+
+                with open(file_path, "rb") as f:
                     file_content = f.read()
+
                 ocr_text = extract_text(file_content, file.filename, settings)
                 file.ocr_text = ocr_text
+
             except Exception as exc:
                 logger.exception("OCR failed for file %s in job %s", file.filename, job_id)
                 file.status = "failed"
@@ -151,13 +186,27 @@ async def process_job(
                 all_success = False
                 continue
 
-            # AI Classification
+            # Store raw OCR text on the Job row (first file wins for multi-file jobs)
+            if not job.raw_data:
+                job.raw_data = ocr_text
+                session.add(job)
+                session.commit()
+
+            _write_event(session, job, "ocr_done", "processing",
+                         raw_data=ocr_text[:500] if ocr_text else None,
+                         detail=f"File: {file.filename}")
+
+            # ── AI Classification ─────────────────────────────────────────────
             try:
                 classification = await classify_document(ocr_text, settings, context=job.context)
                 file.ai_result = classification.model_dump_json()
                 file.status = "completed"
+                _write_event(session, job, "ai_done", "processing",
+                             detail=f"File: {file.filename}, type: {classification.document_type}")
             except Exception as exc:
-                logger.exception("AI classification failed for file %s in job %s", file.filename, job_id)
+                logger.exception(
+                    "AI classification failed for file %s in job %s", file.filename, job_id
+                )
                 file.status = "failed"
                 file.error_message = f"AI classification failed: {exc}"
                 all_success = False
@@ -165,29 +214,27 @@ async def process_job(
             session.add(file)
             session.commit()
 
-        # Mark job terminal state
-        job.status = "completed" if all_success else "failed"
-        session.add(job)
-        session.commit()
+        # Note: job terminal status (completed/failed) is set by the worker,
+        # not here, so the worker can handle the folder rename atomically.
 
-        # Fire V1 legacy webhook if this was submitted via /api/v1/analyze
+        # ── V1 legacy webhook ─────────────────────────────────────────────────
         if job.legacy_document_id and files:
             first_file = files[0]
             status_str = "success" if first_file.status == "completed" else "failed"
-            classification = ClassificationResult()
+            classification_result = ClassificationResult()
             if first_file.ai_result:
-                classification = ClassificationResult(**json.loads(first_file.ai_result))
+                classification_result = ClassificationResult(**json.loads(first_file.ai_result))
 
             payload = WebhookPayload(
                 document_id=job.legacy_document_id,
                 status=status_str,
                 ocr_text=first_file.ocr_text,
-                classification=classification,
+                classification=classification_result,
                 error_message=first_file.error_message,
             )
             await deliver_webhook(payload, settings)
 
-        # Fire V2 webhook if a webhook_url was provided by the caller
+        # ── V2 webhook ────────────────────────────────────────────────────────
         if job.webhook_url:
             file_results = []
             for file in files:
@@ -207,88 +254,10 @@ async def process_job(
 
             v2_payload = JobWebhookPayload(
                 job_id=str(job.id),
-                status="success" if job.status == "completed" else "failed",
+                status="success" if all_success else "failed",
                 files=file_results,
             )
-            await deliver_job_webhook(v2_payload, settings)
+            callback_ok = await deliver_job_webhook(v2_payload, settings, custom_url=job.webhook_url)
+            return all_success, callback_ok
 
-
-async def process_queue_job(
-    job_id: uuid.UUID,
-    meta: "JobMeta | None",
-    settings: "Settings",
-) -> None:
-    """
-    Wrapper around process_job() that additionally persists results to the
-    person-centric trie store.
-
-    This is called by the filesystem-backed worker pool.  The existing
-    process_job() function is invoked unchanged; after it completes, we
-    read the AI results back out of SQLite and write them to
-    data/people/<person_id>/trie/.
-
-    Person resolution
-    -----------------
-    If the job metadata already carries a person_id (supplied by Poneglyph at
-    submission time), that is used directly.  Otherwise we use the LLM-extracted
-    person_name + dob to look up or create a person via trie_store.
-
-    Idempotency
-    -----------
-    trie_store.insert() checks whether this job_id has already been written
-    for the person before doing any work, so retries are safe.
-    """
-    # Run the core OCR / LLM / webhook pipeline (unchanged)
-    await process_job(job_id=job_id, settings=settings)
-
-    # Read back the results to persist into the trie
-    with Session(engine) as session:
-        job = session.get(Job, job_id)
-        if not job:
-            logger.warning("process_queue_job: job %s not found in DB after processing", job_id)
-            return
-
-        files = session.exec(select(JobFile).where(JobFile.job_id == job_id)).all()
-
-    job_id_str = str(job_id)
-
-    for file in files:
-        if file.status != "completed" or not file.ai_result:
-            continue
-
-        try:
-            ai = json.loads(file.ai_result)
-        except Exception:
-            logger.warning("process_queue_job: could not parse ai_result for file %s", file.id)
-            continue
-
-        person_name: str | None = ai.get("person_name") or (
-            ai.get("extracted_data", {}).get("person_name") if isinstance(ai.get("extracted_data"), dict) else None
-        )
-        dob: str | None = ai.get("dob") or (
-            ai.get("extracted_data", {}).get("dob") if isinstance(ai.get("extracted_data"), dict) else None
-        )
-
-        if not person_name:
-            logger.debug(
-                "process_queue_job: no person_name extracted for job %s file %s — skipping trie write",
-                job_id_str, file.filename,
-            )
-            continue
-
-        # Resolve person_id
-        if meta and meta.person_id:
-            person_id = meta.person_id
-        else:
-            person_id = trie_store.get_or_create_person(person_name, dob)
-
-        # Persist to trie (idempotent)
-        trie_store.insert(
-            person_id=person_id,
-            person_name=person_name,
-            extracted_data=ai,
-            job_id=job_id_str,
-            dob=dob,
-        )
-
-    logger.info("process_queue_job: trie update complete for job %s", job_id_str)
+    return all_success, True

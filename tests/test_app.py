@@ -588,16 +588,18 @@ class TestWorker:
         w = Worker(s)
         await w.start()
         try:
-            # Patch process_document to block so the first job stays in queue
-            with patch("app.worker.process_document", new_callable=AsyncMock) as mock_proc:
+            # Patch process_job (the pipeline entry point) to block
+            with patch("app.worker.process_job", new_callable=AsyncMock) as mock_proc:
                 event = asyncio.Event()
                 async def slow_process(*args, **kwargs):
                     await event.wait()
+                    return True, True
                 mock_proc.side_effect = slow_process
 
-                await w.enqueue(Job(document_id=1, file_content=b"a", filename="a.png"))
+                # Fill the single-slot queue
+                w.push_to_channel("dummy-id-1")
                 with pytest.raises(asyncio.QueueFull):
-                    await w.enqueue(Job(document_id=2, file_content=b"b", filename="b.png"))
+                    w._queue.put_nowait("dummy-id-2")
                 event.set()
         finally:
             await w.stop()
